@@ -33,31 +33,30 @@ const int pinLight         = A2;  // Lampu Chamber
 #define VP_ICON_HEAT     0x1300
 
 // =================================================================
-// 4. PARAMETER KALIBRASI & FILTER (SENSOR CWT)
+// 4. PARAMETER KALIBRASI, FILTER & PRESISI ±0.5
 // =================================================================
-const unsigned long COMP_DELAY = 5000; // Jeda proteksi kompresor
+const unsigned long COMP_DELAY = 30000; // Jeda proteksi kompresor (30 detik)
 bool compReady = true;
 unsigned long compTimer = 0;
 bool reqComp = false;
 
-// Timer Siklus 1 Menit Mist Maker
-unsigned long lastMistToggle = 0;
-bool mistCycleState = true; 
-const unsigned long MIST_INTERVAL = 60000; // 60.000 ms (1 Menit)
-
-// Kalibrasi Suhu CWT (Update Regresi 2 HTC)
+// Kalibrasi & Filter Suhu CWT
 const float SLOPE_TEMP   = 1.035; 
 const float OFFSET_TEMP  = -1.2; 
-const float ALPHA_TEMP   = 0.3;    // Filter EMA Suhu
+const float ALPHA_TEMP   = 0.3;   
 
-// Kalibrasi Kelembapan Digital CWT
+// Kalibrasi & Filter Kelembapan CWT
 const float SLOPE_HUMI   = 1.0;
 const float OFFSET_HUMI  = 0.3; 
-const float ALPHA_HUMI   = 0.03;   // Filter EMA Kelembapan (Didesain lebih tenang)
+const float ALPHA_HUMI   = 0.03;   
 
-// Histeresis Kontrol On/Off
-const float HYS_TEMP     = 0.2;
-const float HYS_HUMI     = 0.5;
+// Target Presisi ±0.5
+const float HYS_TEMP     = 0.2;    // Target Suhu ±0.5 C
+const float HYS_HUMI     = 0.2;    // Target RH ±0.5 %
+
+// Zona Pengereman (Soft Landing) sebelum menyentuh setpoint
+const float BRAKE_ZONE_TEMP = 1.5; // Mulai mengerem 1.5 C sebelum target
+const float BRAKE_ZONE_HUMI = 3.0; // Mulai mengerem 3.0 % sebelum target
 
 // =================================================================
 // 5. VARIABEL GLOBAL & OBJEK MODBUS
@@ -73,6 +72,11 @@ bool  cwtOnline  = false;
 
 bool systemRunning = false; 
 bool lightStatus   = false; 
+byte currentCase   = 0;
+
+// Variabel Duty Cycle (0.0 - 1.0) untuk Slow PWM
+float dutyHeater = 0.0;
+float dutyHumid  = 0.0;
 
 ModbusMaster nodeDWIN;
 ModbusMaster nodeCWT;
@@ -88,7 +92,7 @@ void postTxCWT()  { SERIAL_CWT.flush(); delayMicroseconds(50); digitalWrite(PIN_
 // =================================================================
 void setup() {
   Serial.begin(115200);        
-  Serial2.begin(9600);       
+  Serial2.begin(9600);        
   SERIAL_DWIN.begin(115200);   
   SERIAL_CWT.begin(9600);      
 
@@ -114,10 +118,6 @@ void setup() {
   nodeCWT.begin(2, SERIAL_CWT);
   nodeCWT.preTransmission(preTxCWT);
   nodeCWT.postTransmission(postTxCWT);
-
-  Serial.println(F("=================================================="));
-  Serial.println(F("  CLIMATIC CHAMBER: FULL CWT CONTROL (PT100 OFF)  "));
-  Serial.println(F("=================================================="));
 }
 
 // =================================================================
@@ -148,8 +148,10 @@ void loop() {
 
   if (systemRunning) {
     kontrolOtomatis();
+    eksekusiSlowPWM(); // Eksekusi denyut halus setiap siklus loop
   } else {
     forceAllOff(); 
+    currentCase = 0;
   }
 
   static unsigned long lastESPUpdate = 0;
@@ -168,9 +170,6 @@ void loop() {
 // =================================================================
 // MODUL PEMBACAAN SENSOR CWT RS485
 // =================================================================
-// =================================================================
-// MODUL PEMBACAAN SENSOR CWT RS485 (DENGAN ANTI-NOISE & RATE LIMITER)
-// =================================================================
 void readSensorCWT() {
   uint8_t result = nodeCWT.readHoldingRegisters(0x0000, 2);
 
@@ -182,35 +181,17 @@ void readSensorCWT() {
     cwtRawHumi = rawH / 10.0;
     cwtRawTemp = rawT / 10.0;
 
-    // 1. BENTENG KONTROL KELEMBAPAN (RH)
     if (cwtRawHumi >= 0.0 && cwtRawHumi <= 100.0) {
-      float calHumi = cwtRawHumi + OFFSET_HUMI;
-
-      // A. SPIKE REJECTION: Jika data mentah melompat > 10% dalam 1 detik, abaikan!
+      float calHumi = (cwtRawHumi * SLOPE_HUMI) + OFFSET_HUMI;
       static float lastValidRawHumi = 50.0;
       if (abs(calHumi - lastValidRawHumi) > 10.0) {
-        calHumi = lastValidRawHumi; // Pakai data lama yang stabil
+        calHumi = lastValidRawHumi;
       } else {
-        lastValidRawHumi = calHumi; // Update data valid
+        lastValidRawHumi = calHumi;
       }
-
-      // B. FILTER EMA DASAR
-      float targetEMA = (calHumi * ALPHA_HUMI) + (filteredHumi * (1.0 - ALPHA_HUMI));
-
-      // C. HARD RATE LIMITER: Kunci perubahan maksimal 0.05% per detik
-      const float MAX_CHANGE_PER_SEC = 0.05; 
-      float delta = targetEMA - filteredHumi;
-
-      if (delta > MAX_CHANGE_PER_SEC) {
-        filteredHumi += MAX_CHANGE_PER_SEC;
-      } else if (delta < -MAX_CHANGE_PER_SEC) {
-        filteredHumi -= MAX_CHANGE_PER_SEC;
-      } else {
-        filteredHumi = targetEMA;
-      }
+      filteredHumi = (calHumi * ALPHA_HUMI) + (filteredHumi * (1.0 - ALPHA_HUMI));
     }
 
-    // 2. KONTROL SUHU (TETAP PRESISI SAMA SEPERTI SEBELUMNYA)
     if (cwtRawTemp >= -40.0 && cwtRawTemp <= 120.0) {
       float calTemp = (cwtRawTemp * SLOPE_TEMP) + OFFSET_TEMP;
       filteredSuhu = (calTemp * ALPHA_TEMP) + (filteredSuhu * (1.0 - ALPHA_TEMP));
@@ -221,10 +202,16 @@ void readSensorCWT() {
 }
 
 // =================================================================
-// LOGIKA KONTROL AKTUATOR OTOMATIS
+// LOGIKA KONTROL PRESISI (9 CASE + PROPORTIONAL BRAKING)
 // =================================================================
 void forceAllOff() {
+  dutyHeater = 0.0;
+  dutyHumid  = 0.0;
+  reqComp    = false;
+
   digitalWrite(pinHeater, LOW);
+  digitalWrite(pinHumidifier, LOW);
+  digitalWrite(pinFanHumidifier, LOW);
   
   if (digitalRead(pinCompressor) == HIGH) {
     digitalWrite(pinCompressor, LOW);
@@ -233,18 +220,12 @@ void forceAllOff() {
   } else {
     digitalWrite(pinCompressor, LOW);
   }
-  
-  digitalWrite(pinHumidifier, LOW);
-  digitalWrite(pinFanHumidifier, LOW); 
-  
-  // Reset siklus mist maker
-  mistCycleState = true;
-  lastMistToggle = millis();
 }
 
 void kontrolOtomatis() {
-  if (!cwtOnline) {
+  if (!cwtOnline || setpointTemp <= 0.0 || setpointHumi <= 0.0) {
     forceAllOff();
+    currentCase = 0;
     return;
   }
 
@@ -254,66 +235,85 @@ void kontrolOtomatis() {
     }
   }
 
-  bool cmdHeater = digitalRead(pinHeater);
-  bool cmdHumid  = digitalRead(pinHumidifier);
-  reqComp = false; 
+  float errTemp = setpointTemp - filteredSuhu; // Positif = Kurang panas
+  float errHumi = setpointHumi - filteredHumi; // Positif = Kurang lembap
 
-  // 1. LOGIKA KENDALI SUHU (Jika Target Suhu > 0)
-  if (setpointTemp > 0.0) {
-    if (filteredSuhu < (setpointTemp - HYS_TEMP)) {
-      reqComp = false; 
-      cmdHeater = true; 
-    } else if (filteredSuhu >= setpointTemp) {
-      cmdHeater = false; 
-    }
+  // Klasifikasi Status (-1: Kurang, 0: Masuk ±0.5, 1: Lebih)
+  int stateTemp = (errTemp > HYS_TEMP) ? -1 : ((errTemp < -HYS_TEMP) ? 1 : 0);
+  int stateHumi = (errHumi > HYS_HUMI) ? -1 : ((errHumi < -HYS_HUMI) ? 1 : 0);
 
-    if (filteredSuhu > (setpointTemp + HYS_TEMP)) {
-      reqComp = true; 
-    } else if (filteredSuhu <= setpointTemp && reqComp == true) {
-      reqComp = false; 
-    }
-  } else {
-    cmdHeater = false; 
+  // Hitung daya proporsional (Soft Landing) saat mendekati setpoint
+  // Jika selisih >= BRAKE_ZONE -> 100% (1.0). Jika selisih kecil -> mengecil hingga min 25% (0.25)
+  float propHeat  = constrain(errTemp / BRAKE_ZONE_TEMP, 0.25, 1.0);
+  float propHumid = constrain(errHumi / BRAKE_ZONE_HUMI, 0.25, 1.0);
+
+  dutyHeater = 0.0;
+  dutyHumid  = 0.0;
+  reqComp    = false;
+
+  // --- MATRIKS 9 CASE ---
+  if (stateTemp == 0 && stateHumi == 0) {
+    // CASE 1: Tercapai semua (±0.5) -> Total Standby
+    currentCase = 1;
   }
-
-  // 2. LOGIKA KENDALI KELEMBAPAN (Jika Target RH > 0)
-  if (setpointHumi > 0.0) {
-    if (filteredHumi < (setpointHumi - HYS_HUMI)) {
-      
-      // SIKLUS 1 MENIT ON / 1 MENIT OFF
-      if (millis() - lastMistToggle >= MIST_INTERVAL) {
-        lastMistToggle = millis();
-        mistCycleState = !mistCycleState; // Berganti status ON/OFF
-      }
-      cmdHumid = mistCycleState;
-
-    } else if (filteredHumi >= setpointHumi) {
-      cmdHumid = false; 
-      mistCycleState = true; // Reset agar saat dibutuhkan langsung ON dari menit pertama
-      lastMistToggle = millis();
-    }
-
-    // OVERRIDE DEHUMIDIFIKASI (SUBCOOL & REHEAT)
-    if (filteredHumi > (setpointHumi + HYS_HUMI)) {
-      reqComp = true;   
-      cmdHumid = false; 
-      
-      if (setpointTemp > 0.0 && filteredSuhu <= setpointTemp) {
-        cmdHeater = true; 
-      }
-    }
-  } else {
-    cmdHumid = false; 
-    mistCycleState = true;
+  else if (stateTemp == 0 && stateHumi == -1) {
+    // CASE 2: Suhu pas, RH kurang -> Mist Maker berdenyut halus sesuai jarak error
+    currentCase = 2;
+    dutyHumid = propHumid;
   }
+  else if (stateTemp == 0 && stateHumi == 1) {
+    // CASE 3: Suhu pas, RH lebih -> Kompresor ON + Heater penyeimbang (50% daya)
+    currentCase = 3;
+    reqComp = true;
+    // Heater hanya menyala jika suhu mulai turun di bawah setpoint (mencegah overshoot panas)
+    dutyHeater = (errTemp > -0.1) ? 0.50 : 0.0; 
+  }
+  else if (stateTemp == -1 && stateHumi == 0) {
+    // CASE 4: Suhu kurang, RH pas -> Heater berdenyut halus
+    currentCase = 4;
+    dutyHeater = propHeat;
+  }
+  else if (stateTemp == 1 && stateHumi == 0) {
+    // CASE 5: Suhu lebih, RH pas -> Kompresor ON
+    currentCase = 5;
+    reqComp = true;
+  }
+  else if (stateTemp == 1 && stateHumi == -1) {
+    // CASE 6: Suhu lebih, RH kurang -> Selesaikan suhu dulu dengan Kompresor
+    currentCase = 6;
+    reqComp = true;
+  }
+  else if (stateTemp == -1 && stateHumi == -1) {
+    // CASE 7: Suhu kurang, RH kurang -> Heater + Mist Maker (keduanya mengerem halus)
+    currentCase = 7;
+    dutyHeater = propHeat;
+    dutyHumid  = propHumid;
+  }
+  else if (stateTemp == 1 && stateHumi == 1) {
+    // CASE 8: Suhu lebih, RH lebih -> Kompresor menurunkan keduanya
+    currentCase = 8;
+    reqComp = true;
+  }
+  else if (stateTemp == -1 && stateHumi == 1) {
+    // CASE 9: Suhu kurang, RH lebih -> Buang RH dulu pakai Kompresor
+    currentCase = 9;
+    reqComp = true;
+  }
+}
 
-  // 3. EKSEKUSI KE PIN HARDWARE
-  digitalWrite(pinHeater, cmdHeater ? HIGH : LOW);
-  digitalWrite(pinHumidifier, cmdHumid ? HIGH : LOW);
-  
-  // Kipas Mist Maker murni mengikuti status Mist Maker (Pin A13)
-  digitalWrite(pinFanHumidifier, cmdHumid ? HIGH : LOW);
+// =================================================================
+// EKSEKUSI AKTUATOR (HEATER ON/OFF MURNI TANPA CLICK-CLICK)
+// =================================================================
+void eksekusiSlowPWM() {
+  // 1. Heater: On/Off Murni (Relay mekanik aman, tidak bunyi click-click)
+  digitalWrite(pinHeater, (dutyHeater > 0.0) ? HIGH : LOW);
 
+  // 2. Mist Maker: On/Off Murni
+  bool humidOn = (dutyHumid > 0.0);
+  digitalWrite(pinHumidifier, humidOn ? HIGH : LOW);
+  digitalWrite(pinFanHumidifier, humidOn ? HIGH : LOW);
+
+  // 3. Eksekusi Kompresor (Tetap On/Off dengan Proteksi Delay)
   if (reqComp) {
     if (compReady) {
       digitalWrite(pinCompressor, HIGH);
@@ -328,7 +328,7 @@ void kontrolOtomatis() {
 }
 
 // =================================================================
-// MODUL MODBUS LAYAR DWIN
+// MODUL MODBUS LAYAR DWIN & TELEMETRI (TETAP SAMA)
 // =================================================================
 void checkLightTrigger() {
   if (nodeDWIN.readHoldingRegisters(VP_LIGHT_TRIGGER, 1) == nodeDWIN.ku8MBSuccess) {
@@ -367,7 +367,7 @@ void sendDataToLCD() {
 }
 
 void updateActuatorIcons() {
-  nodeDWIN.writeSingleRegister(VP_ICON_RH,   digitalRead(pinHumidifier)); 
+  nodeDWIN.writeSingleRegister(VP_ICON_RH, (dutyHumid > 0.0) ? 1 : 0); 
   
   static uint16_t blinkState = 0;
   blinkState = !blinkState; 
@@ -382,12 +382,9 @@ void updateActuatorIcons() {
   }
   
   nodeDWIN.writeSingleRegister(VP_ICON_COMP, stateComp); 
-  nodeDWIN.writeSingleRegister(VP_ICON_HEAT, digitalRead(pinHeater));     
+  nodeDWIN.writeSingleRegister(VP_ICON_HEAT, (dutyHeater > 0.0) ? 1 : 0);     
 }
 
-// =================================================================
-// TELEMETRI & SERIAL MONITOR
-// =================================================================
 void kirimDataKeESP() {
   Serial2.print(filteredSuhu, 1); Serial2.print(",");
   Serial2.print(filteredHumi, 1); Serial2.print(",");
@@ -398,17 +395,11 @@ void kirimDataKeESP() {
 }
 
 void tampilDebug() {
-  Serial.println(F("\n>>> CLIMATIC CHAMBER (FULL CWT SENSOR) <<<"));
-  Serial.print(F("STATE       : ")); Serial.println(systemRunning ? F("[ RUNNING ]") : F("[ STANDBY ]"));
-  Serial.print(F("SUHU (CWT)  : ")); Serial.print(filteredSuhu, 2); Serial.println(F(" C"));
-  Serial.print(F("HUMI (CWT)  : ")); Serial.print(filteredHumi, 1); Serial.println(F(" %"));
-  Serial.print(F("STATUS CWT  : ")); Serial.println(cwtOnline ? F("[ ONLINE ]") : F("[ TIMEOUT / OFFLINE ]"));
-  
-  Serial.println(F("--- STATUS AKTUATOR ---"));
-  Serial.print(F("Heater      : ")); Serial.println(digitalRead(pinHeater) ? F("ON") : F("OFF"));
-  Serial.print(F("Compressor  : ")); Serial.println(digitalRead(pinCompressor) ? F("ON") : F("OFF"));
-  Serial.print(F("Humidifier  : ")); Serial.println(digitalRead(pinHumidifier) ? F("ON") : F("OFF"));
-  Serial.print(F("Fan Mist    : ")); Serial.println(digitalRead(pinFanHumidifier) ? F("ON") : F("OFF"));
-  Serial.print(F("Lampu       : ")); Serial.println(digitalRead(pinLight) ? F("ON") : F("OFF"));
+  Serial.println(F("\n>>> CLIMATIC CHAMBER (PRECISION ±0.5) <<<"));
+  Serial.print(F("ACTIVE CASE  : CASE ")); Serial.println(currentCase);
+  Serial.print(F("SUHU (CWT)   : ")); Serial.print(filteredSuhu, 2); Serial.print(F(" / ")); Serial.print(setpointTemp, 1); Serial.println(F(" C"));
+  Serial.print(F("HUMI (CWT)   : ")); Serial.print(filteredHumi, 2); Serial.print(F(" / ")); Serial.print(setpointHumi, 1); Serial.println(F(" %"));
+  Serial.print(F("DUTY HEAT/RH : ")); Serial.print(dutyHeater * 100, 0); Serial.print(F("% / ")); Serial.print(dutyHumid * 100, 0); Serial.println(F("%"));
+  Serial.print(F("COMPRESSOR   : ")); Serial.println(digitalRead(pinCompressor) ? F("ON") : (reqComp ? F("WAITING DELAY") : F("OFF")));
   Serial.println(F("------------------------------------------"));
 }
